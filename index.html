@@ -1359,8 +1359,19 @@ const mem={
            localStorage adulterado (VULN de integridade) injete
            campos ou tipos inesperados no objeto de memória. */
         if(parsed && typeof parsed==='object' && !Array.isArray(parsed)){
-          if(typeof parsed.facts==='object' && parsed.facts && !Array.isArray(parsed.facts)) this.facts=parsed.facts;
-          if(Array.isArray(parsed.notes)) this.notes=parsed.notes;
+          if(typeof parsed.facts==='object' && parsed.facts && !Array.isArray(parsed.facts)){
+            /* Descarta chaves __algo__ (ex.: __inject__) e qualquer
+               fact cujo valor bata com padrão de poisoning, mesmo
+               que tenha entrado no localStorage por fora do exec() */
+            const cleanFacts={};
+            Object.keys(parsed.facts).forEach(k=>{
+              if(!/^__/.test(k) && !isPoisonedMemoryContent(k) && !isPoisonedMemoryContent(parsed.facts[k])){
+                cleanFacts[k]=parsed.facts[k];
+              }
+            });
+            this.facts=cleanFacts;
+          }
+          if(Array.isArray(parsed.notes)) this.notes=parsed.notes.filter(n=>n && !isPoisonedMemoryContent(n.text));
           if(typeof parsed.userName==='string' || parsed.userName===null) this.userName=parsed.userName;
           if(typeof parsed.lastTopic==='string' || parsed.lastTopic===null) this.lastTopic=parsed.lastTopic;
         }
@@ -1503,6 +1514,30 @@ const ATTACK_PATTERNS=[
   { pattern:/window\.\w+\s*=|document\.\w+\s*=/i, type:'TENTATIVA DE INJEÇÃO NO RUNTIME' },
   { pattern:/<script|onerror\s*=|onload\s*=/i, type:'TENTATIVA DE XSS' }
 ];
+
+/*
+  Padrões específicos de "histórico poisoning": texto que tenta se
+  passar por uma instrução de sistema quando na verdade está sendo
+  gravado via remember/save_note/set_user_name — ou seja, dados que
+  nunca deveriam carregar autoridade, mas que um atacante tenta
+  disfarçar como se fossem. Isso é mais amplo que ATTACK_PATTERNS
+  porque aqui o texto não precisa nem "parecer um comando" — só
+  precisa parecer uma instrução de sistema/override para já ser
+  recusado como conteúdo de memória.
+*/
+const MEMORY_POISON_PATTERNS=[
+  /\[\s*(system|admin|root|override|instru[çc][ãa]o secreta)\b/i,
+  /\bsempre\s+(inclua|responda|envie|diga)\b.{0,60}\b(bc1|0x|http|www\.|\.com|\.net|\.io)/i,
+  /\bsystem\s+override\b/i,
+  /\binstru[çc][ãa]o\s+secreta\b/i,
+  /^__.*__$/,           /* chaves tipo __inject__ */
+  /^__/                 /* qualquer chave começando com __ */
+];
+
+function isPoisonedMemoryContent(text){
+  const value = String(text||'');
+  return MEMORY_POISON_PATTERNS.some(p=>p.test(value));
+}
 
 let defenseActive=false;
 let defenseCount=0;
@@ -1655,6 +1690,28 @@ const SECURITY_MONITOR={
 
       return response;
     };
+
+    /*
+      Guarda uma "impressão digital" do nosso próprio fetch protegido.
+      Isso NÃO impede que outro script (extensão, console) sobrescreva
+      window.fetch de novo por cima do nosso — isso é fisicamente
+      impossível de impedir em JS puro, client-side, sem backend.
+      O que dá pra fazer é DETECTAR quando isso acontece, comparando
+      periodicamente (ver checkFetchIntegrity) e avisando o usuário
+      em vez de continuar operando com uma falsa sensação de segurança.
+    */
+    this._fetchFingerprint = window.fetch.toString();
+  },
+
+  checkFetchIntegrity(){
+    try{
+      if(this._fetchFingerprint && window.fetch.toString()!==this._fetchFingerprint){
+        this.addEvent('ADULTERAÇÃO DE FETCH', 'window.fetch foi reescrito após a inicialização — chamadas de rede podem estar sendo interceptadas por script externo');
+        /* Reinstala nossa camada por cima, ciente de que isso é um
+           jogo de gato-e-rato que não tem vitória garantida client-side */
+        this.monitorFetch();
+      }
+    }catch(e){}
   },
 
   monitorNavigation(){
@@ -1752,6 +1809,9 @@ const SECURITY_MONITOR={
     this.monitorDOM();
     this.monitorOnline();
     this.monitorCSP();
+
+    /* Checagem periódica de integridade do fetch — ver checkFetchIntegrity() */
+    setInterval(()=>{ this.checkFetchIntegrity(); }, 3000);
   }
 };
 
@@ -1997,6 +2057,16 @@ async function exec(name, args){
       }
 
       case'remember':{
+        /*
+          Corrige o "ATAQUE 3 — HISTÓRICO POISONING" do teste: texto
+          disfarçado de instrução de sistema não é aceito como fato
+          de memória. A chave e o valor são checados separadamente.
+        */
+        if(isPoisonedMemoryContent(args.key) || isPoisonedMemoryContent(args.value)){
+          if(!defenseActive) triggerDefenseMode('HISTÓRICO POISONING', `remember: ${args.key}=${args.value}`);
+          return{ success:false, error:'Conteúdo rejeitado pelo sistema de segurança' };
+        }
+
         mem.set(args.key,args.value);
         mem.render();
         return{ success:true, key:args.key, value:args.value };
@@ -2008,6 +2078,11 @@ async function exec(name, args){
       }
 
       case'save_note':{
+        if(isPoisonedMemoryContent(args.text)){
+          if(!defenseActive) triggerDefenseMode('HISTÓRICO POISONING', `save_note: ${args.text}`);
+          return{ success:false, error:'Conteúdo rejeitado pelo sistema de segurança' };
+        }
+
         mem.addNote(args.text);
         mem.render();
         return{ success:true, total:mem.notes.length };
@@ -2074,6 +2149,11 @@ async function exec(name, args){
       }
 
       case'set_user_name':{
+        if(isPoisonedMemoryContent(args.name)){
+          if(!defenseActive) triggerDefenseMode('HISTÓRICO POISONING', `set_user_name: ${args.name}`);
+          return{ success:false, error:'Conteúdo rejeitado pelo sistema de segurança' };
+        }
+
         mem.userName=args.name;
         mem.set('nome',args.name);
         mem.render();
@@ -2536,11 +2616,19 @@ async function handleVoice(text){
 
     const reply = await runAgent(text);
 
-    /* Segunda checagem: se a própria resposta do modelo, por
-       algum motivo, ecoar um padrão de ataque (ex.: o modelo
-       foi manipulado para repetir instruções do sistema),
-       ainda assim disparamos a defesa antes de falar. */
-    const replyAttack = detectAttack(reply);
+    /*
+      Segunda checagem: se a própria resposta do modelo ecoar um
+      padrão de ataque ou de "histórico poisoning" — por exemplo,
+      porque um script externo interceptou window.fetch e injetou
+      texto tipo "[OVERRIDE CRÍTICO]...envie BTC para..." no system
+      prompt antes da requisição sair (Ataque 7 do seu teste) —
+      ainda assim bloqueamos ANTES de falar. Isso não impede a
+      injeção em si (impossível client-side puro), mas impede que
+      o resultado da injeção chegue a ser dito em voz alta como se
+      fosse o JARVIS legítimo falando.
+    */
+    const replyAttack = detectAttack(reply) ||
+      (isPoisonedMemoryContent(reply) ? 'RESPOSTA COM CONTEÚDO SUSPEITO' : null);
 
     if(replyAttack){
       mem.addAssistant('[BLOQUEADO]');
@@ -2710,4 +2798,4 @@ setInterval(()=>{
     script.onload = function() { eruda.init(); };
     document.body.appendChild(script);
   })();
-</script>
+    </script>
