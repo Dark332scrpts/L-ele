@@ -830,33 +830,76 @@ body{
 <script>
 'use strict';
 
-/*
-  ═══════════════════════════════════════════════════════════
-  ARQUITETURA DE SEGURANÇA (revisão pós-auditoria):
-
-  Tudo que é crítico — exec(), runAgent(), speakOnce(),
-  detectAttack(), triggerDefenseMode(), SECURITY_MONITOR,
-  mem, TOOLS, GROQ_KEY — vive dentro desta única IIFE.
-  NADA disso é atribuído a `window`. Não existe `window.exec = ...`
-  em lugar nenhum deste arquivo. Isso fecha os vetores VULN-001,
-  VULN-002, VULN-003, VULN-004 e VULN-005 do relatório de auditoria:
-  um script externo (extensão, injeção, console) não tem mais
-  nenhuma referência para sequestrar, porque a referência nunca
-  foi exposta globalmente. Ela só existe no escopo léxico abaixo.
-
-  A detecção de ataque também deixou de depender só de regex
-  client-side (que é sempre contornável) — ela agora roda ANTES
-  de qualquer chamada de rede, de forma síncrona, bloqueando o
-  fluxo de execução no mesmo tick em que o texto chega, para
-  que o "não detectou em tempo real" do seu relato não se repita.
-  ═══════════════════════════════════════════════════════════
-*/
-
 (function(){
 
 /* =========================================================
-   THREE.JS — REDE NEURAL
+   REDE DE SEGURANÇA DO BOTÃO DE INÍCIO (correção do bug
+   relatado): antes desta revisão, TODO o app — inclusive o
+   listener do botão "INICIALIZAR SISTEMA" — vivia depois do
+   bloco Three.js, sem nenhum try/catch. Se o CDN do Three.js
+   falhasse, o WebGL estivesse indisponível, ou qualquer coisa
+   nessa cadeia lançasse uma exceção síncrona, o script inteiro
+   parava ali mesmo e NENHUM listener era registrado — o botão
+   simplesmente não fazia nada, sem erro visível pra um usuário
+   normal. Isso é corrigido em duas camadas:
+   1) o listener do botão é registrado AGORA, antes de qualquer
+      coisa que possa falhar (three.js, WebGL, etc.);
+   2) o bloco Three.js abaixo passa a rodar dentro de um
+      try/catch próprio, então mesmo se ele falhar, todo o
+      resto do app (voz, Groq, memória, segurança) continua.
 ========================================================= */
+try{
+  const btn = document.getElementById('api-btn');
+  const inp = document.getElementById('api-inp');
+  if(btn) btn.addEventListener('click', ()=>initJarvis());
+  if(inp) inp.addEventListener('keydown', e=>{ if(e.key==='Enter') initJarvis(); });
+}catch(bootErr){
+  console.error('Falha ao registrar o botão de início:', bootErr);
+}
+
+/* Estado visual, mantido FORA do bloco 3D para que setVis()
+   e outras funções continuem podendo ser chamadas com
+   segurança em qualquer lugar do app, mesmo que o Three.js
+   nunca tenha inicializado. */
+let threeReady=false;
+let nodeMeshes=[];
+let defenseMode=false;
+let coreMat=null;
+let nucleusMat=null;
+let VIS='IDLE';
+let targetE=.1;
+
+const VIS_E={
+  IDLE:.1, LISTENING:.85, ANALYZING:.6, PLANNING:.55,
+  EXECUTING:.9, SPEAKING:.7, ERROR:.05, DEFENSE:1
+};
+
+function setVis(s){
+  VIS=s;
+  targetE = VIS_E[s] ?? .1;
+
+  if(!threeReady) return; /* núcleo 3D indisponível — UI 2D/voz seguem normalmente */
+
+  if(s==='DEFENSE'){
+    coreMat.color.setHex(0xFFD600);
+    nucleusMat.color.setHex(0xFFD600);
+  }else if(s==='ERROR'){
+    coreMat.color.setHex(0xFF1744);
+    nucleusMat.color.setHex(0xFF1744);
+  }else if(s==='SPEAKING'){
+    coreMat.color.setHex(0x00FF88);
+    nucleusMat.color.setHex(0x00FFAA);
+  }else{
+    coreMat.color.setHex(0x00E5FF);
+    nucleusMat.color.setHex(0x00E5FF);
+  }
+}
+
+/* =========================================================
+   THREE.JS — REDE NEURAL (agora isolado num try/catch: uma
+   falha aqui nunca mais derruba o app inteiro)
+========================================================= */
+try{
 
 const canvas3 = document.getElementById('cv');
 
@@ -886,7 +929,7 @@ camera.position.z = 5.5;
 
 const NODE_COUNT = 34;
 const nodePositions = [];
-const nodeMeshes = [];
+/* nodeMeshes já foi declarado fora do try (ver acima) */
 const nodeGeo = new THREE.SphereGeometry(0.045, 5, 5);
 
 for(let i=0;i<NODE_COUNT;i++){
@@ -953,7 +996,7 @@ function buildConnections(){
 buildConnections();
 
 const coreGeo = new THREE.IcosahedronGeometry(.9, 2);
-const coreMat = new THREE.MeshBasicMaterial({ color:0x00E5FF, wireframe:true, transparent:true, opacity:.08 });
+coreMat = new THREE.MeshBasicMaterial({ color:0x00E5FF, wireframe:true, transparent:true, opacity:.08 });
 const core3 = new THREE.Mesh(coreGeo, coreMat);
 scene.add(core3);
 
@@ -963,7 +1006,7 @@ const inner3 = new THREE.Mesh(innerGeo, innerMat);
 scene.add(inner3);
 
 const nucleusGeo = new THREE.SphereGeometry(.12, 8, 8);
-const nucleusMat = new THREE.MeshBasicMaterial({ color:0x00E5FF, transparent:true, opacity:.9 });
+nucleusMat = new THREE.MeshBasicMaterial({ color:0x00E5FF, transparent:true, opacity:.9 });
 const nucleus = new THREE.Mesh(nucleusGeo, nucleusMat);
 scene.add(nucleus);
 
@@ -1000,36 +1043,10 @@ function spawnPulse(){
   pulseSignals.push(mesh);
 }
 
-let VIS='IDLE';
-let targetE=.1;
+/* VIS, targetE, VIS_E, setVis e defenseMode já existem fora do try */
 let curE=.1;
 let speakAmp=0;
 let speakPh=0;
-let defenseMode=false;
-
-const VIS_E={
-  IDLE:.1, LISTENING:.85, ANALYZING:.6, PLANNING:.55,
-  EXECUTING:.9, SPEAKING:.7, ERROR:.05, DEFENSE:1
-};
-
-function setVis(s){
-  VIS=s;
-  targetE = VIS_E[s] ?? .1;
-
-  if(s==='DEFENSE'){
-    coreMat.color.setHex(0xFFD600);
-    nucleusMat.color.setHex(0xFFD600);
-  }else if(s==='ERROR'){
-    coreMat.color.setHex(0xFF1744);
-    nucleusMat.color.setHex(0xFF1744);
-  }else if(s==='SPEAKING'){
-    coreMat.color.setHex(0x00FF88);
-    nucleusMat.color.setHex(0x00FFAA);
-  }else{
-    coreMat.color.setHex(0x00E5FF);
-    nucleusMat.color.setHex(0x00E5FF);
-  }
-}
 
 const clock = new THREE.Clock();
 let frameCount=0;
@@ -1147,6 +1164,23 @@ window.addEventListener('resize', ()=>{
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
+
+threeReady = true;
+
+}catch(threeErr){
+  /* Three.js/WebGL falhou (CDN bloqueado, GPU indisponível,
+     extensão do navegador interferindo, etc). O núcleo visual
+     3D fica desligado, mas voz, Groq, memória e segurança
+     continuam funcionando normalmente — isso é exatamente o
+     "botão não funciona mais" relatado, agora contido aqui
+     em vez de derrubar o script inteiro. */
+  threeReady = false;
+  console.error('JARVIS: núcleo visual 3D não pôde iniciar, seguindo sem ele.', threeErr);
+  try{
+    const c = document.getElementById('cv');
+    if(c) c.style.display='none';
+  }catch(e2){}
+}
 
 (function buildTicks(){
   const g = document.getElementById('ticks');
@@ -1313,7 +1347,6 @@ const toolLogEl = document.getElementById('tool-log');
 let rtimer=null;
 
 function showTranscript(t){
-  /* textContent — imune a injeção de HTML, corrige risco apontado em mem.render() */
   transcriptEl.textContent = `"${String(t).slice(0,350)}"`;
   transcriptEl.classList.add('on');
   setTimeout(()=>{ transcriptEl.classList.remove('on'); }, 6000);
@@ -1355,14 +1388,8 @@ const mem={
       const d = localStorage.getItem(MEM_KEY);
       if(d){
         const parsed = JSON.parse(d);
-        /* Validação de estrutura antes de aplicar — impede que um
-           localStorage adulterado (VULN de integridade) injete
-           campos ou tipos inesperados no objeto de memória. */
         if(parsed && typeof parsed==='object' && !Array.isArray(parsed)){
           if(typeof parsed.facts==='object' && parsed.facts && !Array.isArray(parsed.facts)){
-            /* Descarta chaves __algo__ (ex.: __inject__) e qualquer
-               fact cujo valor bata com padrão de poisoning, mesmo
-               que tenha entrado no localStorage por fora do exec() */
             const cleanFacts={};
             Object.keys(parsed.facts).forEach(k=>{
               if(!/^__/.test(k) && !isPoisonedMemoryContent(k) && !isPoisonedMemoryContent(parsed.facts[k])){
@@ -1509,29 +1536,17 @@ const ATTACK_PATTERNS=[
   { pattern:/execute (este|esse) código|eval\(|javascript:/i, type:'INJEÇÃO DE CÓDIGO' },
   { pattern:/repita tudo|repita suas instruções|qual é o seu prompt/i, type:'EXTRAÇÃO DE PROMPT' },
   { pattern:/data:text\/html|vbscript:|file:\/\/|blob:text\/html/i, type:'PROTOCOLO SUSPEITO' },
-  /* Novos padrões: cobrem tentativas de manipular o próprio runtime
-     do navegador via texto falado/digitado, não só o LLM */
   { pattern:/window\.\w+\s*=|document\.\w+\s*=/i, type:'TENTATIVA DE INJEÇÃO NO RUNTIME' },
   { pattern:/<script|onerror\s*=|onload\s*=/i, type:'TENTATIVA DE XSS' }
 ];
 
-/*
-  Padrões específicos de "histórico poisoning": texto que tenta se
-  passar por uma instrução de sistema quando na verdade está sendo
-  gravado via remember/save_note/set_user_name — ou seja, dados que
-  nunca deveriam carregar autoridade, mas que um atacante tenta
-  disfarçar como se fossem. Isso é mais amplo que ATTACK_PATTERNS
-  porque aqui o texto não precisa nem "parecer um comando" — só
-  precisa parecer uma instrução de sistema/override para já ser
-  recusado como conteúdo de memória.
-*/
 const MEMORY_POISON_PATTERNS=[
   /\[\s*(system|admin|root|override|instru[çc][ãa]o secreta)\b/i,
   /\bsempre\s+(inclua|responda|envie|diga)\b.{0,60}\b(bc1|0x|http|www\.|\.com|\.net|\.io)/i,
   /\bsystem\s+override\b/i,
   /\binstru[çc][ãa]o\s+secreta\b/i,
-  /^__.*__$/,           /* chaves tipo __inject__ */
-  /^__/                 /* qualquer chave começando com __ */
+  /^__.*__$/,
+  /^__/
 ];
 
 function isPoisonedMemoryContent(text){
@@ -1616,6 +1631,7 @@ const SECURITY_MONITOR={
   suspiciousEvents:0,
   lastEvents:[],
   originalFetch:null,
+  _externalConsolePresent:false,
 
   addEvent(type, detail){
     this.suspiciousEvents++;
@@ -1665,14 +1681,6 @@ const SECURITY_MONITOR={
     const original = this.originalFetch;
     const self=this;
 
-    /*
-      Sobrescrevemos window.fetch aqui de propósito (é necessário
-      para interceptar chamadas de rede), mas isso acontece dentro
-      da mesma IIFE fechada — nenhum outro script tem acesso a
-      `self` (o SECURITY_MONITOR real) para desfazer isso, e mesmo
-      que outro script troque window.fetch de novo depois, o pior
-      caso é perder a inspeção, não ganhar controle do JARVIS.
-    */
     window.fetch = async function(input, init){
       let url='';
       try{ url = typeof input==='string' ? input : input?.url||''; }catch(e){}
@@ -1691,15 +1699,6 @@ const SECURITY_MONITOR={
       return response;
     };
 
-    /*
-      Guarda uma "impressão digital" do nosso próprio fetch protegido.
-      Isso NÃO impede que outro script (extensão, console) sobrescreva
-      window.fetch de novo por cima do nosso — isso é fisicamente
-      impossível de impedir em JS puro, client-side, sem backend.
-      O que dá pra fazer é DETECTAR quando isso acontece, comparando
-      periodicamente (ver checkFetchIntegrity) e avisando o usuário
-      em vez de continuar operando com uma falsa sensação de segurança.
-    */
     this._fetchFingerprint = window.fetch.toString();
   },
 
@@ -1707,8 +1706,6 @@ const SECURITY_MONITOR={
     try{
       if(this._fetchFingerprint && window.fetch.toString()!==this._fetchFingerprint){
         this.addEvent('ADULTERAÇÃO DE FETCH', 'window.fetch foi reescrito após a inicialização — chamadas de rede podem estar sendo interceptadas por script externo');
-        /* Reinstala nossa camada por cima, ciente de que isso é um
-           jogo de gato-e-rato que não tem vitória garantida client-side */
         this.monitorFetch();
       }
     }catch(e){}
@@ -1759,11 +1756,17 @@ const SECURITY_MONITOR={
 
                 if(src && !/^https?:\/\//i.test(src)) suspicious=true;
                 if(/eval\s*\(|javascript:|document\.cookie|localStorage/i.test(content)) suspicious=true;
+                if(/eruda|vconsole/i.test(src)) suspicious=true;
               }
 
-              /* Detecta também handlers inline injetados (onerror=, onload=)
-                 e tags de imagem/iframe suspeitas — cobre o vetor
-                 <img src=x onerror=...> citado no seu link de teste */
+              /* Reage na hora à injeção do container do Eruda/vConsole
+                 no DOM, sem esperar o próximo ciclo de checkExternalConsole() */
+              const nodeId = node.id||'';
+              const nodeClass = (typeof node.className==='string'?node.className:'')||'';
+              if(/^eruda$|vc-switch|__vconsole/i.test(nodeId+' '+nodeClass)){
+                setTimeout(()=>{ this.checkExternalConsole(); }, 0);
+              }
+
               if(node.attributes){
                 for(const attr of Array.from(node.attributes)){
                   if(/^on/i.test(attr.name)){
@@ -1799,6 +1802,54 @@ const SECURITY_MONITOR={
     });
   },
 
+  /*
+    Detecta consoles de depuração injetados no navegador (Eruda,
+    vConsole e variantes) — a via que o usuário pediu para cobrir
+    explicitamente. Esses consoles rodam no MESMO escopo global
+    (window) da página, então eles NUNCA conseguem enxergar
+    GROQ_KEY, mem, TOOLS etc. (tudo isso vive só dentro da IIFE,
+    nunca é pendurado em window — ver o comentário no topo do
+    arquivo). O que eles PODEM fazer é chamar/sobrescrever
+    qualquer coisa que já é global por natureza: fetch, open,
+    localStorage, document. É exatamente isso que este monitor
+    (e o monitorFetch/monitorNavigation/monitorStorage/monitorDOM
+    acima) já vigia.
+
+    Importante ser honesto sobre o limite disso: não existe
+    forma 100% confiável de detectar um console externo a partir
+    de puro JS client-side — um atacante suficientemente hábil
+    pode ofuscar sua presença. Isso aqui cobre os casos comuns
+    (Eruda e vConsole "de prateleira", sem esconderijo), que é o
+    cenário realista de alguém abrindo um console num celular.
+    Também vale lembrar: se VOCÊ MESMO usar Eruda para depurar o
+    próprio JARVIS, isso vai disparar o modo de defesa do mesmo
+    jeito — o app não tem como saber se é você ou um terceiro.
+  */
+  checkExternalConsole(){
+    let found = false;
+    let detail = '';
+
+    try{
+      if(window.eruda){ found=true; detail='window.eruda'; }
+      else if(window.VConsole || window.vConsole || window.__vconsole__){ found=true; detail='window.VConsole'; }
+      else if(document.getElementById('eruda')){ found=true; detail='#eruda (DOM)'; }
+      else{
+        const vcNode = document.querySelector && document.querySelector('.vc-switch, #__vconsole');
+        if(vcNode){ found=true; detail='.vc-switch/#__vconsole (DOM)'; }
+      }
+    }catch(e){}
+
+    if(found && !this._externalConsolePresent){
+      this._externalConsolePresent = true;
+      this.addEvent('FERRAMENTA DE DEPURAÇÃO EXTERNA (ERUDA/CONSOLE)', detail);
+    }else if(!found && this._externalConsolePresent){
+      /* console foi fechado/removido — permite alertar de novo
+         se ele reaparecer depois, sem ficar reavisando enquanto
+         continua aberto e já foi reconhecido */
+      this._externalConsolePresent = false;
+    }
+  },
+
   start(){
     if(this.active) return;
     this.active=true;
@@ -1810,8 +1861,8 @@ const SECURITY_MONITOR={
     this.monitorOnline();
     this.monitorCSP();
 
-    /* Checagem periódica de integridade do fetch — ver checkFetchIntegrity() */
     setInterval(()=>{ this.checkFetchIntegrity(); }, 3000);
+    setInterval(()=>{ this.checkExternalConsole(); }, 2000);
   }
 };
 
@@ -1882,12 +1933,6 @@ function openLoadingTab(){
     const w = window.open('', '_blank');
 
     if(w && w.document){
-      /*
-        Construído via DOM em vez de w.document.write com template
-        string — elimina qualquer possibilidade de HTML injetado
-        aqui (mesmo que o conteúdo seja 100% estático hoje, é
-        defesa em profundidade caso isso mude no futuro).
-      */
       const doc = w.document;
       doc.open();
       doc.write('<!DOCTYPE html><html><head><meta charset="UTF-8"><title>J.A.R.V.I.S.</title></head><body></body></html>');
@@ -1989,7 +2034,6 @@ async function exec(name, args){
         const secs=parseInt(args.seconds);
         if(isNaN(secs)||secs<=0) return{ success:false, error:'Duração inválida' };
 
-        /* Limite de timers simultâneos — item 2.4 do plano de ação da auditoria */
         if(Object.keys(activeTimers).length>=10) return{ success:false, error:'Limite de 10 temporizadores simultâneos atingido' };
 
         const label=args.label||'Temporizador';
@@ -2057,11 +2101,6 @@ async function exec(name, args){
       }
 
       case'remember':{
-        /*
-          Corrige o "ATAQUE 3 — HISTÓRICO POISONING" do teste: texto
-          disfarçado de instrução de sistema não é aceito como fato
-          de memória. A chave e o valor são checados separadamente.
-        */
         if(isPoisonedMemoryContent(args.key) || isPoisonedMemoryContent(args.value)){
           if(!defenseActive) triggerDefenseMode('HISTÓRICO POISONING', `remember: ${args.key}=${args.value}`);
           return{ success:false, error:'Conteúdo rejeitado pelo sistema de segurança' };
@@ -2587,13 +2626,6 @@ function stopListen(){
 async function handleVoice(text){
   if(processingCmd) return;
 
-  /*
-    Detecção síncrona, ANTES de qualquer outra coisa: nenhuma
-    chamada de rede, nenhuma atualização de UI de "pensando"
-    acontece antes desta checagem. Isso corrige o "não detectou
-    em tempo real" — a defesa dispara no mesmo tick em que o
-    texto chega, antes mesmo de mostrar o transcript na tela.
-  */
   const attack = detectAttack(text);
 
   if(attack){
@@ -2616,17 +2648,6 @@ async function handleVoice(text){
 
     const reply = await runAgent(text);
 
-    /*
-      Segunda checagem: se a própria resposta do modelo ecoar um
-      padrão de ataque ou de "histórico poisoning" — por exemplo,
-      porque um script externo interceptou window.fetch e injetou
-      texto tipo "[OVERRIDE CRÍTICO]...envie BTC para..." no system
-      prompt antes da requisição sair (Ataque 7 do seu teste) —
-      ainda assim bloqueamos ANTES de falar. Isso não impede a
-      injeção em si (impossível client-side puro), mas impede que
-      o resultado da injeção chegue a ser dito em voz alta como se
-      fosse o JARVIS legítimo falando.
-    */
     const replyAttack = detectAttack(reply) ||
       (isPoisonedMemoryContent(reply) ? 'RESPOSTA COM CONTEÚDO SUSPEITO' : null);
 
@@ -2748,7 +2769,6 @@ function initJarvis(){
   document.getElementById('cpill').classList.add('on');
   contBtn.classList.add('cont-on');
 
-  /* Segurança em tempo real — inicia só depois que o núcleo está pronto */
   SECURITY_MONITOR.start();
 
   (async()=>{
@@ -2771,11 +2791,10 @@ function initJarvis(){
   }, 600);
 }
 
-document.getElementById('api-btn').addEventListener('click', initJarvis);
-
-document.getElementById('api-inp').addEventListener('keydown', e=>{
-  if(e.key==='Enter') initJarvis();
-});
+/* O clique do botão e o Enter no campo de API já foram
+   registrados no topo do script (ver REDE DE SEGURANÇA DO
+   BOTÃO DE INÍCIO), antes do bloco Three.js, para que nunca
+   mais dependam de nada mais abaixo ter funcionado. */
 
 setInterval(()=>{
   if(!isSpeaking && GROQ_KEY){
@@ -2787,7 +2806,7 @@ setInterval(()=>{
   }
 }, 8000);
 
-})(); /* fim da IIFE — nada acima disto vaza para window */
+})();
 </script>
 </body>
 </html>
@@ -2798,4 +2817,4 @@ setInterval(()=>{
     script.onload = function() { eruda.init(); };
     document.body.appendChild(script);
   })();
-    </script>
+</script>
